@@ -62,6 +62,11 @@ def main() -> int:
     dt = torch.bfloat16 if cfg.precision.params_dtype == "bfloat16" else torch.float32
     is_lite = bool(cfg.model.get("lite") if hasattr(cfg.model, "get") else None)
     if is_lite:
+        # The lite model is built/trained/saved uniformly in fp32 (the bf16 was
+        # only ever an autocast at train time). Sample in fp32 end-to-end so the
+        # embedding, heads, and the VibeVoice decode all share one dtype — the
+        # selective bf16 head cast below is a container-path (TE/Megatron) device.
+        dt = torch.float32
         # No-container path: plain-torch TorchBackbone + lite (.pt) checkpoint.
         from latent_lm.models.latent_lm import LatentLM, LatentLMConfig
         from latent_lm.models.torch_backbone import TorchBackbone, TorchBackboneConfig
