@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -N latentlm-tests
+#PBS -l rt_QC=1
+#PBS -l walltime=00:30:00
+#PBS -W group_list=qgah50068
+#PBS -j oe
+#PBS -k oed
+#PBS -o logs/run_tests.log
+
+# Run the CPU test suite inside the SIF on a compute node.
+# DO NOT run pytest / singularity exec on the login node — submit this job:
+#     qsub examples/pbs/run_tests.pbs
+#
+# The tests are CPU-only (no GPU needed), so this uses the rt_QC CPU queue.
+# Env: SIF (path to the .sif image), REPO_ROOT.
+
+set -euo pipefail
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}"
+REPO_ROOT="$(readlink -f "${REPO_ROOT}")"
+SIF="$(readlink -f "${SIF:-${REPO_ROOT}/nemo_latentlm.sif}")"
+
+C_SCRATCH="${PBS_LOCALDIR:-/tmp}/cont_scratch"
+mkdir -p "${REPO_ROOT}/logs" "${C_SCRATCH}"/{home,cache,hf}
+cd "${REPO_ROOT}"
+
+# Hard timeout so a misbehaving test can never run away (belt and braces).
+timeout 1200 singularity exec --no-home \
+    --bind "${REPO_ROOT}:${REPO_ROOT}" \
+    --bind "${C_SCRATCH}/home:/root" \
+    --bind "${C_SCRATCH}/cache:${C_SCRATCH}/cache" \
+    --env XDG_CACHE_HOME="${C_SCRATCH}/cache" \
+    --env HF_HOME="${C_SCRATCH}/hf" \
+    --env PYTHONPATH="${REPO_ROOT}" \
+    --env OMP_NUM_THREADS=4 \
+    "${SIF}" \
+    bash -c "cd ${REPO_ROOT} && timeout 900 python -m pytest tests/ -q"
+
+echo "[run_tests] done"
