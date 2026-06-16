@@ -102,7 +102,7 @@ def main() -> int:
     log(f"[train_lite] params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M  "
         f"vocab={tok.vocab_size}  device={device}")
 
-    loss_fn = build_loss(cfg)
+    loss_fn = build_loss(cfg).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=float(cfg.optim.lr),
@@ -172,10 +172,13 @@ def main() -> int:
                 is_audio_input=batch["is_audio_input"],
                 attention_mask=batch.get("attention_mask"),
                 cu_seqlens=batch.get("cu_seqlens"))
-        losses = loss_fn(
-            text_logits=out["text_logits"].float(), text_targets=batch["text_targets"],
-            audio_targets=batch["audio_targets"].to(dt), audio_mask=batch["audio_mask"],
-            hidden_states=out["hidden"].to(dt), diff_head=inner.diffusion_head)
+            # Keep the loss (incl. the fp32 diffusion-head matmuls) inside autocast
+            # so the head's fp32 weights and the bf16 activations are reconciled by
+            # autocast instead of raising a dtype mismatch.
+            losses = loss_fn(
+                text_logits=out["text_logits"].float(), text_targets=batch["text_targets"],
+                audio_targets=batch["audio_targets"], audio_mask=batch["audio_mask"],
+                hidden_states=out["hidden"], diff_head=inner.diffusion_head)
         (losses["loss"] / grad_accum).backward()
         accum += 1
         if accum < grad_accum:

@@ -87,4 +87,4 @@ runtime:
 
 paths:
   output_dir: ${oc.env:LATENT_LM_OUTPUT_DIR,outputs/tts_qwen_500m_smoke}
-  hf_cache_dir: ${oc.env:HF_HOME,~/.cache/huggingface}
+  hf_cache_dir: ${oc.env:HF_HOME,'~/.cache/huggingface'}
