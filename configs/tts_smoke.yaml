@@ -1,0 +1,90 @@
+# Smoke variant of tts_qwen_500m.yaml — short train/eval/checkpoint cadences
+# so an end-to-end train.py run completes in ~10 min and exercises save/resume
+# with the new dist_checkpointing format.
+
+model:
+  hf_model_id: Qwen/Qwen2.5-0.5B
+  load_hf_weights: true
+  latent_dim: 64
+  diff_head_layers: 3
+  diff_head_ffn_mult: 4
+  dtype: bfloat16
+
+tokenizer:
+  text: Qwen/Qwen2.5-0.5B
+  audio: microsoft/VibeVoice-AcousticTokenizer
+
+data:
+  dataset_id: amphion/Emilia-Dataset
+  config_name: null
+  split: train
+  languages: []
+  min_audio_seconds: 1.0
+  max_audio_seconds: 20.0
+  shuffle_buffer: 100              # smaller for faster startup
+  num_workers: 2                   # smaller for fewer file handles
+  max_text_tokens: 256
+  max_latent_frames: 200
+  cache_dir: null
+  pin_memory: true
+
+loss:
+  alpha_diff: 5.0
+  ce_chunk_size: 0
+  ddpm:
+    num_timesteps: 1000
+    schedule: cosine
+    timesteps_per_forward: 4
+    prediction_type: v_prediction
+
+optim:
+  optimizer: adamw
+  use_muon: true
+  muon_lr: 5.0e-4
+  muon_momentum: 0.9
+  lr: 2.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  warmup_steps: 5                  # tiny for smoke
+  max_steps: 100                   # tiny for smoke
+  lr_schedule: cosine
+
+parallelism:
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 1
+  sequence_parallel: false
+
+precision:
+  params_dtype: bfloat16
+  amp: bf16-mixed
+  fp8: null              # disabled — TE FP8 state doesn't survive save/load (see tts_qwen_500m.yaml).
+  fp8_amax_history_len: 1024
+  fp8_amax_compute_algo: max
+
+recompute:
+  granularity: null
+  method: uniform
+  num_layers: 1
+
+runtime:
+  micro_batch_size: 2
+  packed_total_length: 8192
+  gradient_accumulation_steps: 8
+  log_every_n_steps: 1             # log every step in smoke
+  eval_every_n_steps: 5            # in-process validation cadence
+  eval_batches: 4                  # 4 batches → ~32 samples per eval point
+  checkpoint_every_n_steps: 10     # save twice in 25-step run, plus final
+  keep_last_k_checkpoints: 3
+  compile: false
+  use_packed_attn: false
+  enable_cuda_graph: false
+  wandb:
+    project: null                  # disabled in smoke
+    entity: null
+    name: null
+
+paths:
+  output_dir: ${oc.env:LATENT_LM_OUTPUT_DIR,outputs/tts_qwen_500m_smoke}
+  hf_cache_dir: ${oc.env:HF_HOME,~/.cache/huggingface}

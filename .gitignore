@@ -1,0 +1,44 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.env
+
+# Artifacts that live outside the repo
+*.sif
+*.img
+checkpoints/
+outputs/
+wandb/
+logs/
+datasets/
+hf_cache/
+# pre-encoded latent shards + downloaded HF snapshots
+cache/
+# pip-installed packages that override the broken editable installs
+# in the NeMo container
+extras/
+*.wav
+*.flac
+*.mp3
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Harness / local cruft
+.claude/
+tea_debug.log
+tb/

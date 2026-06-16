@@ -1,0 +1,115 @@
+# LatentLM TTS — Qwen2.5-0.5B via Megatron-Bridge.
+# Architecture is read from the HF config inside Bridge's provider; only the
+# diffusion-head + latent geometry keys below feed our LatentLM wrapper.
+
+model:
+  hf_model_id: Qwen/Qwen2.5-0.5B
+  load_hf_weights: true
+  latent_dim: 64
+  diff_head_layers: 3
+  diff_head_ffn_mult: 4
+  dtype: bfloat16
+
+tokenizer:
+  text: Qwen/Qwen2.5-0.5B       # 151643 base vocab; we pad to multiple of 128 for TP alignment
+  audio: microsoft/VibeVoice-AcousticTokenizer
+
+data:
+  dataset_id: amphion/Emilia-Dataset
+  config_name: null
+  split: train
+  languages: []                 # multilingual — Qwen tokenizer handles all 6 Emilia languages
+  min_audio_seconds: 1.0
+  max_audio_seconds: 20.0
+  shuffle_buffer: 1000
+  num_workers: 4
+  max_text_tokens: 256
+  max_latent_frames: 200
+  cache_dir: null
+  pin_memory: true
+
+loss:
+  alpha_diff: 1.0                  # was 1.0; balance backbone gradient vs LM CE
+  ce_chunk_size: 0                 # disabled — chunked CE + checkpoint may
+                                   # interact badly with DDP gradient bucketing
+                                   # (suspect: silent stall after step 0).
+  ddpm:
+    num_timesteps: 1000
+    schedule: cosine
+    timesteps_per_forward: 4       # paper recommendation; OK with micro_batch=2
+                                   # + packed_attn=false (the OOM was with bigger
+                                   # batch + thd kernel intermediates combined).
+    prediction_type: v_prediction  # v target — the actual fix for diff plateau
+
+optim:
+  optimizer: adamw
+  use_muon: true                   # Muon (Newton-Schulz orthogonalised SGD) for
+                                   # 2D Linear weights; AdamW for everything else
+                                   # (biases, embeddings, lm_head, norms).
+  muon_lr: 5.0e-4                  # halved from 1e-3 due to plateau at lm≈3.9
+                                   # with growing oscillation amplitude.
+  muon_momentum: 0.9               # was 0.95; window 20→10 to reduce buildup
+  lr: 2.0e-4                       # AdamW lr for the non-matrix params (biases,
+                                   # embeddings, lm_head, norms). Same as before.
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  warmup_steps: 1000               # was 5000; opt steps take 8x longer with
+                                   # accum=8, so 1000 opt steps ≈ 8000 micro.
+  max_steps: 50000                 # was 200000; opt steps cost 8x more
+  lr_schedule: cosine
+
+parallelism:
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 1
+  sequence_parallel: false
+
+precision:
+  params_dtype: bfloat16
+  amp: bf16-mixed
+  fp8: null              # disabled — TE FP8 module state (outside state_dict
+                         # and _extra_state) doesn't survive save/load
+                         # round-trip, producing lm 3.9 → 17.2 on resume.
+                         # See diag_save_load_isolate (job 136322): with FP8
+                         # off, save/load is bit-perfect; with FP8 on, broken
+                         # despite weights round-tripping cleanly. Reinstating
+                         # FP8 requires fixing TE weight_quantizer cache
+                         # invalidation post-load.
+  fp8_amax_history_len: 1024
+  fp8_amax_compute_algo: max
+
+recompute:
+  granularity: null
+  method: uniform
+  num_layers: 1
+
+runtime:
+  micro_batch_size: 2              # real L = 2 × 8192 = 16384. micro_batch=4
+                                   # OOM'd with K=4 + packed_attn=true: backbone
+                                   # activations + thd kernel intermediates +
+                                   # K-replicated diff-head input pushed past 80GB.
+  packed_total_length: 8192
+  gradient_accumulation_steps: 8   # 8 micro-steps × 65K tokens = 524K tokens/opt
+                                   # step. Paper uses 5M tokens/step (10x more).
+                                   # Effective batch ~ 524K → lower grad noise →
+                                   # supports 10x higher LR (5e-4).
+  log_every_n_steps: 20
+  eval_every_n_steps: 500
+  eval_batches: 20
+  checkpoint_every_n_steps: 2000
+  keep_last_k_checkpoints: 3
+  compile: false             # tried mode='default'+dynamic=True — still hit
+                             # inductor shape assert on packed L (varies per pack).
+                             # Defer until TE+inductor interaction is debugged.
+  use_packed_attn: false     # disabled — bisecting the post-step-0 stall.
+                             # Will reflip once the minimal config is stable.
+  enable_cuda_graph: false   # Megatron CudaGraphManager wants inference RNG tracker.
+  wandb:
+    project: latentlm-tts
+    entity: null               # set to your wandb team/user, or leave null
+    name: null                 # null → output_dir basename
+
+paths:
+  output_dir: ${oc.env:LATENT_LM_OUTPUT_DIR,outputs/tts_qwen_500m}
+  hf_cache_dir: ${oc.env:HF_HOME,~/.cache/huggingface}

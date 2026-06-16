@@ -1,0 +1,92 @@
+# LatentLM TTS — Qwen3-4B-Base via Megatron-Bridge.
+# Single-node smoke (4 H100, TP=4, DP=1). Bumps for production:
+#   - context to 8192+, micro_batch up if memory allows
+#   - DP across more nodes
+#   - longer warmup_steps / max_steps
+
+model:
+  hf_model_id: Qwen/Qwen3-4B-Base
+  load_hf_weights: true
+  latent_dim: 64
+  diff_head_layers: 3
+  diff_head_ffn_mult: 4
+  dtype: bfloat16
+
+tokenizer:
+  text: Qwen/Qwen3-4B-Base
+  audio: microsoft/VibeVoice-AcousticTokenizer
+
+data:
+  dataset_id: amphion/Emilia-Dataset
+  config_name: null
+  split: train
+  languages: []
+  min_audio_seconds: 1.0
+  max_audio_seconds: 20.0
+  shuffle_buffer: 1000
+  num_workers: 16
+  max_text_tokens: 256
+  max_latent_frames: 200
+  cache_dir: null
+  pin_memory: true
+
+loss:
+  alpha_diff: 5.0
+  ce_chunk_size: 0
+  ddpm:
+    num_timesteps: 1000
+    schedule: cosine
+    timesteps_per_forward: 4
+    prediction_type: v_prediction
+
+optim:
+  optimizer: adamw
+  use_muon: true
+  muon_lr: 5.0e-4         # halved vs 0.5B — bigger model, more sensitive
+  muon_momentum: 0.95
+  lr: 1.0e-4              # halved AdamW lr too
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  warmup_steps: 1000
+  max_steps: 50000
+  lr_schedule: cosine
+
+parallelism:
+  tensor_model_parallel_size: 4   # split 4B params + opt state across 4 H100
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 1
+  sequence_parallel: false
+
+precision:
+  params_dtype: bfloat16
+  amp: bf16-mixed
+  fp8: null              # disabled — TE FP8 state doesn't survive save/load (see tts_qwen_500m.yaml).
+  fp8_amax_history_len: 1024
+  fp8_amax_compute_algo: max
+
+recompute:
+  granularity: full       # 4B activations don't fit at L=4096 + micro=1 without
+  method: uniform         # full activation checkpointing.
+  num_layers: 1
+
+runtime:
+  micro_batch_size: 1
+  packed_total_length: 4096
+  gradient_accumulation_steps: 4
+  log_every_n_steps: 5
+  eval_every_n_steps: 500
+  eval_batches: 10
+  checkpoint_every_n_steps: 500
+  keep_last_k_checkpoints: 2
+  compile: false
+  use_packed_attn: false
+  enable_cuda_graph: false
+  wandb:
+    project: latentlm-tts
+    entity: null
+    name: tts_qwen3_4b
+
+paths:
+  output_dir: ${oc.env:LATENT_LM_OUTPUT_DIR,outputs/tts_qwen3_4b}
+  hf_cache_dir: ${oc.env:HF_HOME,~/.cache/huggingface}

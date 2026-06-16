@@ -1,0 +1,92 @@
+#!/bin/bash
+#PBS -N latentlm-cache-emilia
+#PBS -l rt_QG=1
+#PBS -l walltime=72:00:00
+#PBS -W group_list=qgah50068
+#PBS -j oe
+#PBS -k oed
+#PBS -o logs/cache_emilia.log
+
+# Pre-encode Emilia audio into VibeVoice latent shards on one H100.
+#
+# Tunables via env:
+#   CACHE_DIR    — where shards land (default: <repo>/cache/emilia_en)
+#   LANGUAGES    — space-separated, e.g. "en" or "en zh"  (default: en)
+#   MAX_SHARDS   — per-rank cap on shards to write         (default: 200)
+#   SHARD_SIZE   — examples per shard                      (default: 1000)
+#   BATCH_SIZE   — VibeVoice encode batch                  (default: 8)
+#   START_INDEX  — first shard index (for resume)          (default: 0)
+#   RANK         — job rank for sharded parallel jobs      (default: 0)
+#   WORLD_SIZE   — total parallel cache jobs               (default: 1)
+#   NUM_WORKERS  — DataLoader workers (parallel HF streams; default: 8)
+#   LOCAL_DATA_DIR — local Emilia snapshot path (skip HF) (default: empty)
+#
+# To run N parallel cache jobs:
+#   for r in 0 1 2 3 4 5 6 7; do
+#     RANK=$r WORLD_SIZE=8 qsub scripts/pbs/cache_emilia.pbs
+#   done
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}"
+REPO_ROOT="$(readlink -f "${REPO_ROOT}")"
+SIF="$(readlink -f "${SIF:-${REPO_ROOT}/nemo_latentlm.sif}")"
+EXTRAS="${EXTRAS:-${REPO_ROOT}/extras}"
+
+CACHE_DIR="${CACHE_DIR:-${REPO_ROOT}/cache/emilia_en}"
+LANGUAGES="${LANGUAGES:-en}"
+MAX_SHARDS="${MAX_SHARDS:-1000000}"   # effectively unlimited — each rank
+                                      # naturally ends when its stream slice
+                                      # is exhausted; this is a circuit breaker
+SHARD_SIZE="${SHARD_SIZE:-1000}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+START_INDEX="${START_INDEX:-0}"
+RANK="${RANK:-0}"
+WORLD_SIZE="${WORLD_SIZE:-1}"
+NUM_WORKERS="${NUM_WORKERS:-8}"    # measured sweet spot — beyond 8 the
+                                   # per-node HF/CPU bandwidth saturates
+LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-}"
+
+# HF auth from the login shell's saved token.
+: "${HF_TOKEN:=${HUGGING_FACE_HUB_TOKEN:-}}"
+if [ -z "${HF_TOKEN}" ] && [ -s "${HOME}/.cache/huggingface/token" ]; then
+    HF_TOKEN="$(tr -d '[:space:]' < ${HOME}/.cache/huggingface/token)"
+    echo "[cache] picked up HF_TOKEN from ${HOME}/.cache/huggingface/token"
+fi
+export HF_TOKEN HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+
+C_SCRATCH="${PBS_LOCALDIR:-/tmp}/cont_scratch"
+mkdir -p "${REPO_ROOT}/logs" "${CACHE_DIR}" "${C_SCRATCH}"/{home,cache,flashinfer,hf}
+cd "${REPO_ROOT}"
+
+echo "[cache] host=$(hostname)"
+echo "[cache] cache_dir=${CACHE_DIR}"
+echo "[cache] languages=${LANGUAGES}  max_shards=${MAX_SHARDS}  shard_size=${SHARD_SIZE}"
+nvidia-smi -L || true
+
+singularity exec --nv --no-home \
+    --bind "${REPO_ROOT}:${REPO_ROOT}" \
+    --bind "${C_SCRATCH}/home:/root" \
+    --bind "${C_SCRATCH}/home:/home/${USER}" \
+    --bind "${C_SCRATCH}/cache:${C_SCRATCH}/cache" \
+    --env XDG_CACHE_HOME="${C_SCRATCH}/cache" \
+    --env FLASHINFER_JIT_DIR="${C_SCRATCH}/flashinfer" \
+    --env HF_HOME="${C_SCRATCH}/hf" \
+    --env HF_TOKEN="${HF_TOKEN}" \
+    --env HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}" \
+    --env PYTHONPATH="${EXTRAS}:${REPO_ROOT}" \
+    "${SIF}" \
+    bash -c "cd ${REPO_ROOT} && \
+        python -m scripts.cache_latents \
+            --cache-dir ${CACHE_DIR} \
+            --languages ${LANGUAGES} \
+            --max-shards ${MAX_SHARDS} \
+            --shard-size ${SHARD_SIZE} \
+            --batch-size ${BATCH_SIZE} \
+            --start-index ${START_INDEX} \
+            --rank ${RANK} \
+            --world-size ${WORLD_SIZE} \
+            --num-workers ${NUM_WORKERS} \
+            ${LOCAL_DATA_DIR:+--local-data-dir ${LOCAL_DATA_DIR}}"
+
+echo "[cache] done"

@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/nemo:26.04
+
+%labels
+    Maintainer latentLM
+    Purpose "LatentLM (next-token diffusion) training on ABCI-Q"
+    NeMoBase 26.04
+
+# NOTE on ABCI-Q container strategy
+# -----------------------------------------------------------------------------
+# ABCI-Q's Singularity-CE 4.1 does not allow --fakeroot for ordinary users
+# (no subuid/subgid provisioned), which means %post cannot run. We therefore
+# keep this def minimal: it pulls the NGC NeMo image and converts it to SIF
+# without any customisation.
+#
+# Project-specific extras (transformers, datasets, diffusers, soundfile,
+# librosa, VibeVoice snapshot) are installed via scripts/pbs/install_extras.pbs
+# into a user-writable prefix that is bind-mounted at train time. That way the
+# base .sif stays read-only and reusable across projects.
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec "$@"
+
+%help
+    Build (CPU node, no fakeroot):
+        singularity build nemo_latentlm.sif containers/nemo_latentlm.def
+
+    Install project extras into a user-writable prefix afterwards:
+        qsub scripts/pbs/install_extras.pbs
+
+    Train (see scripts/pbs/train_tts.pbs).

@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N latentlm-build-sif
+#PBS -l rt_QC=1
+#PBS -l walltime=02:00:00
+#PBS -W group_list=qgah50068
+#PBS -j oe
+#PBS -k oed
+#PBS -o logs/build_sif.log
+
+# Pull the NeMo base container on a CPU compute node.
+#
+# ABCI-Q's Singularity-CE 4.1 does not allow `singularity build` from a .def
+# file for non-root users (no subuid/subgid, no proot, no remote builder).
+# We therefore use `singularity pull`, which only performs a docker→SIF
+# conversion and needs no elevated privileges.
+#
+# Project-specific extras are installed separately by
+# scripts/pbs/install_extras.pbs into a user-writable prefix that is
+# bind-mounted into the container at train time.
+#
+# Usage:
+#   qsub scripts/pbs/build_sif.pbs
+#
+# Environment overrides:
+#   SIF_OUT     — destination path for the .sif (default: $REPO_ROOT/nemo_latentlm.sif)
+#   IMAGE_URI   — NGC image to pull (default: docker://nvcr.io/nvidia/nemo:26.04)
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}"
+SIF_OUT="${SIF_OUT:-${REPO_ROOT}/nemo_latentlm.sif}"
+IMAGE_URI="${IMAGE_URI:-docker://nvcr.io/nvidia/nemo:26.04}"
+
+# Job-local scratch for the docker layer cache and tmpdir so we don't fill $HOME.
+export SINGULARITY_CACHEDIR="${PBS_LOCALDIR:-/tmp}/sing_cache"
+export SINGULARITY_TMPDIR="${PBS_LOCALDIR:-/tmp}/sing_tmp"
+mkdir -p "${SINGULARITY_CACHEDIR}" "${SINGULARITY_TMPDIR}" "${REPO_ROOT}/logs"
+
+cd "${REPO_ROOT}"
+
+echo "[build_sif] host=$(hostname)"
+echo "[build_sif] image=${IMAGE_URI}"
+echo "[build_sif] out=${SIF_OUT}"
+echo "[build_sif] cache=${SINGULARITY_CACHEDIR}"
+singularity --version
+
+# Remove any stale partial image; --force overwrites an existing .sif.
+singularity pull --force "${SIF_OUT}" "${IMAGE_URI}"
+
+echo "[build_sif] done: $(ls -lh ${SIF_OUT})"

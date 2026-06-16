@@ -1,0 +1,126 @@
+#!/bin/bash
+#PBS -N latentlm-tts
+#PBS -l rt_QF=1
+#PBS -l walltime=24:00:00
+#PBS -W group_list=qgah50068
+#PBS -j oe
+#PBS -k oed
+#PBS -o logs/train_tts.log
+
+# Single-node H100 training for LatentLM TTS (1 × rt_QF = 1 node × 4 H100).
+# TP=1 from the YAML, so DP=4 across the 4 GPUs. To scale to multiple nodes,
+# bump `#PBS -l rt_QF=N` above.
+#
+# Usage:
+#   qsub scripts/pbs/train_tts.pbs
+#   CONFIG=configs/tts_qwen_500m.yaml TRAIN_STEPS=50000 qsub scripts/pbs/train_tts.pbs
+#
+# Env overrides:
+#   SIF           path to .sif (default <repo>/nemo_latentlm.sif)
+#   REPO_ROOT     repo path (default $PBS_O_WORKDIR)
+#   CONFIG        (default configs/tts_qwen_500m.yaml)
+#   TRAIN_STEPS   (default 200000)
+#   RESUME_FROM   path to a checkpoint or its dir-with-`latest`
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}"
+REPO_ROOT="$(readlink -f "${REPO_ROOT}")"
+SIF="$(readlink -f "${SIF:-${REPO_ROOT}/nemo_latentlm.sif}")"
+CONFIG="${CONFIG:-configs/tts_qwen_500m.yaml}"
+EXTRAS="${EXTRAS:-${REPO_ROOT}/extras}"
+TRAIN_STEPS="${TRAIN_STEPS:-50000}"
+RESUME_FROM="${RESUME_FROM:-}"
+
+# HF auth from login shell.
+: "${HF_TOKEN:=${HUGGING_FACE_HUB_TOKEN:-}}"
+if [ -z "${HF_TOKEN}" ] && [ -s "${HOME}/.cache/huggingface/token" ]; then
+    HF_TOKEN="$(tr -d '[:space:]' < ${HOME}/.cache/huggingface/token)"
+fi
+export HF_TOKEN HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+
+if [ -z "${WANDB_API_KEY:-}" ] && [ -s "${HOME}/.netrc" ]; then
+    WANDB_API_KEY="$(awk '/machine api\.wandb\.ai/{f=1} f && /password/{print $2; exit}' \
+        "${HOME}/.netrc")"
+fi
+export WANDB_API_KEY
+
+mkdir -p "${REPO_ROOT}/logs" "${REPO_ROOT}/outputs"
+cd "${REPO_ROOT}"
+
+# Rendezvous: one torchrun per node via mpirun. ABCI-Q denies user SSH
+# between compute nodes; OpenMPI's daemons handle cross-node launch.
+NODES=($(sort -u "${PBS_NODEFILE}" | awk 'NF'))
+NNODES=${#NODES[@]}
+HEAD_NODE="${NODES[0]}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+GPUS_PER_NODE=4
+
+echo "[train_tts] nodes: ${NNODES}  head: ${HEAD_NODE}"
+echo "[train_tts] sif:   ${SIF}"
+echo "[train_tts] cfg:   ${CONFIG}  steps=${TRAIN_STEPS}  resume=${RESUME_FROM:-<none>}"
+
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load openmpi/4.1.7
+
+# Spawn one MPI process per GPU rank (NNODES * GPUS_PER_NODE total). PyTorch's
+# init_process_group reads RANK/WORLD_SIZE/LOCAL_RANK from env, so we map them
+# from OpenMPI's OMPI_COMM_WORLD_* and skip torchrun entirely.
+#
+# `--bind-to none` so dataloader workers inherit the full CPU mask (otherwise
+# OpenMPI's default `bind-to=core` traps every worker onto one core).
+NPROCS=$(( NNODES * GPUS_PER_NODE ))
+
+mpirun \
+    -np "${NPROCS}" \
+    -hostfile "${PBS_NODEFILE}" \
+    --map-by ppr:${GPUS_PER_NODE}:node \
+    --bind-to none \
+    --oversubscribe \
+    -x PATH -x LD_LIBRARY_PATH -x HF_TOKEN -x HUGGING_FACE_HUB_TOKEN -x WANDB_API_KEY \
+    -x LATENT_LM_OUTPUT_DIR \
+    -x LATENT_LM_NCCL_TIMEOUT_S \
+    -x NCCL_DEBUG -x NCCL_DEBUG_SUBSYS \
+    -x TORCH_DISTRIBUTED_DEBUG -x TORCH_NCCL_BLOCKING_WAIT \
+    -x TORCH_NCCL_TRACE_BUFFER_SIZE -x TORCH_NCCL_DUMP_ON_TIMEOUT \
+    -x TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC -x TORCH_NCCL_DEBUG_INFO_TEMP_FILE \
+    bash -c "
+        set -euo pipefail
+        C_SCRATCH=/tmp/cont_scratch_${PBS_JOBID}
+        mkdir -p \${C_SCRATCH}/{home,cache,flashinfer,hf}
+        cd ${REPO_ROOT} &&
+        singularity exec --nv --no-home \
+            --bind ${REPO_ROOT}:${REPO_ROOT} \
+            --bind \${C_SCRATCH}/home:/root \
+            --bind \${C_SCRATCH}/home:/home/${USER} \
+            --bind \${C_SCRATCH}/cache:\${C_SCRATCH}/cache \
+            --env XDG_CACHE_HOME=\${C_SCRATCH}/cache \
+            --env FLASHINFER_JIT_DIR=\${C_SCRATCH}/flashinfer \
+            --env HF_HOME=\${C_SCRATCH}/hf \
+            --env HF_TOKEN=${HF_TOKEN} \
+            --env HUGGING_FACE_HUB_TOKEN=${HF_TOKEN} \
+            --env WANDB_API_KEY=\${WANDB_API_KEY:-} \
+            --env PYTHONPATH=${EXTRAS}:${REPO_ROOT} \
+            --env CUDA_DEVICE_MAX_CONNECTIONS=1 \
+            --env RANK=\${OMPI_COMM_WORLD_RANK} \
+            --env WORLD_SIZE=\${OMPI_COMM_WORLD_SIZE} \
+            --env LOCAL_RANK=\${OMPI_COMM_WORLD_LOCAL_RANK} \
+            --env MASTER_ADDR=${HEAD_NODE} \
+            --env MASTER_PORT=${MASTER_PORT} \
+            --env LATENT_LM_OUTPUT_DIR=\${LATENT_LM_OUTPUT_DIR:-${REPO_ROOT}/outputs/tts_qwen_500m} \
+            --env LATENT_LM_NCCL_TIMEOUT_S=${LATENT_LM_NCCL_TIMEOUT_S:-60} \
+            --env NCCL_DEBUG=${NCCL_DEBUG:-INFO} \
+            --env NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-COLL} \
+            --env TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-DETAIL} \
+            --env TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-1} \
+            --env TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000} \
+            --env TORCH_NCCL_DUMP_ON_TIMEOUT=${TORCH_NCCL_DUMP_ON_TIMEOUT:-1} \
+            --env TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-60} \
+            --env TORCH_NCCL_DEBUG_INFO_TEMP_FILE=${REPO_ROOT}/logs/nccl_dump_${PBS_JOBID%.*} \
+            ${SIF} \
+            python -m latent_lm.train \
+                --config ${CONFIG} \
+                --train-steps ${TRAIN_STEPS} \
+                ${RESUME_FROM:+--resume-from ${RESUME_FROM}}
+    "
+echo "[train_tts] done"
