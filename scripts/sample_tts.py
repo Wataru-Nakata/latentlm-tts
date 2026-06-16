@@ -60,43 +60,18 @@ def main() -> int:
     print(f"[sample] tokenizer: {cfg.tokenizer.text}  vocab={tok.vocab_size}", flush=True)
 
     dt = torch.bfloat16 if cfg.precision.params_dtype == "bfloat16" else torch.float32
-    is_lite = bool(cfg.model.get("lite") if hasattr(cfg.model, "get") else None)
-    if is_lite:
-        # The lite model is built/trained/saved uniformly in fp32 (the bf16 was
-        # only ever an autocast at train time). Sample in fp32 end-to-end so the
-        # embedding, heads, and the VibeVoice decode all share one dtype — the
-        # selective bf16 head cast below is a container-path (TE/Megatron) device.
-        dt = torch.float32
-        # No-container path: plain-torch TorchBackbone + lite (.pt) checkpoint.
-        from latent_lm.models.latent_lm import LatentLM, LatentLMConfig
-        from latent_lm.models.torch_backbone import TorchBackbone, TorchBackboneConfig
-        m = cfg.model.lite
-        packed = int(cfg.runtime.get("packed_total_length", 0) or 0)
-        backbone = TorchBackbone(TorchBackboneConfig(
-            hidden_dim=int(m.hidden_dim), n_layers=int(m.n_layers), n_heads=int(m.n_heads),
-            ffn_mult=int(m.get("ffn_mult", 4)),
-            max_seq_len=max(packed, int(cfg.data.max_text_tokens) + 4 * int(cfg.data.max_latent_frames))))
-        model = LatentLM(LatentLMConfig(
-            vocab_size=tok.vocab_size, hidden_dim=int(m.hidden_dim),
-            latent_dim=int(cfg.model.latent_dim), diff_head_layers=int(cfg.model.diff_head_layers),
-            diff_head_ffn_mult=int(cfg.model.diff_head_ffn_mult)), backbone=backbone).to("cuda")
-    else:
-        from latent_lm.train import build_model
-        model, _ = build_model(cfg, vocab_size=tok.vocab_size)
-        model = model.to("cuda")
+    from latent_lm.train import build_model
+    model, _ = build_model(cfg, vocab_size=tok.vocab_size)
+    model = model.to("cuda")
     model.latent_in_proj.to(dtype=dt)
     model.diffusion_head.to(dtype=dt)
     model.eval()
     print(f"[sample] model built ({sum(p.numel() for p in model.parameters())/1e6:.1f}M)", flush=True)
 
     if args.resume_from:
-        if is_lite:
-            from latent_lm import checkpoint_lite as ckpt_mod
-            ckpt_mod.load(args.resume_from, model, map_location="cuda")
-        else:
-            from latent_lm import checkpoint as ckpt_mod
-            ckpt_mod.load(path=args.resume_from, model=model,
-                          map_location=f"cuda:{torch.cuda.current_device()}")
+        from latent_lm import checkpoint as ckpt_mod
+        ckpt_mod.load(path=args.resume_from, model=model,
+                      map_location=f"cuda:{torch.cuda.current_device()}")
         print(f"[sample] loaded {args.resume_from}", flush=True)
 
     vv = VibeVoiceTokenizer().to("cuda")

@@ -53,10 +53,10 @@ class LatentLMConfig:
 def _megatron_module_base():
     """Return MegatronModule when available (Megatron container), else nn.Module.
 
-    Lets this module import cleanly anywhere Megatron isn't usable — whether it's
-    simply not installed (the no-container / lite path) or only partially present.
-    We catch broadly (not just ImportError) so a broken/half-installed Megatron
-    degrades to the plain-PyTorch base rather than crashing the import.
+    Lets this module import cleanly anywhere Megatron isn't usable — e.g. a CPU
+    test env where it's not installed, or only partially present. We catch broadly
+    (not just ImportError) so a broken/half-installed Megatron degrades to the
+    plain nn.Module base rather than crashing the import.
     """
     try:
         from megatron.core.transformer.module import MegatronModule

@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 
-# Core deps for the lightweight (no-container) path: train_lite, inference,
-# data preprocessing. All pip-installable.
+# Core deps for inference, data preprocessing, and the data side of training.
+# All pip-installable.
 dependencies = [
     "torch>=2.4",
     "numpy",
@@ -22,9 +22,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "mypy"]
-# The large-scale Megatron training path (latent_lm.train) additionally needs
-# megatron-core, megatron-bridge, and transformer-engine — these come from the
-# NVIDIA NeMo container (see containers/nemo_latentlm.def), not from pip.
+# Training (latent_lm.train) needs the Megatron stack: megatron-core,
+# megatron-bridge, and transformer-engine. These are pip-installable but require
+# a matching CUDA toolchain (TE builds against it); the NVIDIA NeMo container
+# (containers/nemo_latentlm.def) bundles them and is the path of least
+# resistance. Not pinned here because the right versions track your CUDA/driver.
+train = ["megatron-core", "megatron-bridge", "transformer-engine"]
 
 [build-system]
 requires = ["hatchling"]

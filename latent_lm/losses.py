@@ -159,7 +159,7 @@ def _lm_cross_entropy(
         tp_world = parallel_state.get_tensor_model_parallel_world_size() \
             if parallel_state.is_initialized() else 1
     except Exception:
-        # Megatron absent or only partially installed (no-container path) → TP=1.
+        # Megatron absent or only partially installed (e.g. CPU tests) → TP=1.
         tp_world = 1
 
     if tp_world > 1:
