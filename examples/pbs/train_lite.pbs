@@ -1,0 +1,51 @@
+#!/bin/bash
+#PBS -N latentlm-train-lite
+#PBS -l rt_QG=1
+#PBS -l walltime=06:00:00
+#PBS -W group_list=qgah50068
+#PBS -j oe
+#PBS -k oed
+#PBS -o logs/train_lite.log
+
+# Lightweight (no-container-deps) training on one GPU, inside the SIF.
+# Streams Emilia, VibeVoice-encodes on the GPU, trains the plain-torch
+# TorchBackbone via latent_lm.train_lite. Submit (never run on the login node):
+#     qsub examples/pbs/train_lite.pbs
+#     qsub -v TRAIN_STEPS=100,CONFIG=configs/tts_lite.yaml examples/pbs/train_lite.pbs
+#
+# Env: SIF, REPO_ROOT, CONFIG (default configs/tts_lite.yaml), TRAIN_STEPS.
+
+set -euo pipefail
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}"
+REPO_ROOT="$(readlink -f "${REPO_ROOT}")"
+SIF="$(readlink -f "${SIF:-${REPO_ROOT}/nemo_latentlm.sif}")"
+CONFIG="${CONFIG:-configs/tts_lite.yaml}"
+TRAIN_STEPS="${TRAIN_STEPS:-1000}"
+
+: "${HF_TOKEN:=${HUGGING_FACE_HUB_TOKEN:-}}"
+if [ -z "${HF_TOKEN}" ] && [ -s "${HOME}/.cache/huggingface/token" ]; then
+    HF_TOKEN="$(tr -d '[:space:]' < ${HOME}/.cache/huggingface/token)"
+fi
+export HF_TOKEN HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+
+C_SCRATCH="${PBS_LOCALDIR:-/tmp}/cont_scratch"
+mkdir -p "${REPO_ROOT}/logs" "${REPO_ROOT}/outputs" "${C_SCRATCH}"/{home,cache,flashinfer,hf}
+cd "${REPO_ROOT}"
+nvidia-smi -L || true
+
+singularity exec --nv --no-home \
+    --bind "${REPO_ROOT}:${REPO_ROOT}" \
+    --bind "${C_SCRATCH}/home:/root" \
+    --bind "${C_SCRATCH}/cache:${C_SCRATCH}/cache" \
+    --env XDG_CACHE_HOME="${C_SCRATCH}/cache" \
+    --env FLASHINFER_JIT_DIR="${C_SCRATCH}/flashinfer" \
+    --env HF_HOME="${C_SCRATCH}/hf" \
+    --env HF_TOKEN="${HF_TOKEN}" \
+    --env HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}" \
+    --env PYTHONPATH="${REPO_ROOT}" \
+    --env LATENT_LM_OUTPUT_DIR="${LATENT_LM_OUTPUT_DIR:-${REPO_ROOT}/outputs/tts_lite}" \
+    --env RANK=0 --env WORLD_SIZE=1 --env LOCAL_RANK=0 \
+    "${SIF}" \
+    bash -c "cd ${REPO_ROOT} && python -m latent_lm.train_lite --config ${CONFIG} --train-steps ${TRAIN_STEPS}"
+
+echo "[train_lite] done"
