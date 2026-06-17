@@ -31,6 +31,12 @@ CONFIG="${CONFIG:-configs/tts_qwen_500m.yaml}"
 EXTRAS="${EXTRAS:-${REPO_ROOT}/extras}"
 TRAIN_STEPS="${TRAIN_STEPS:-50000}"
 RESUME_FROM="${RESUME_FROM:-}"
+# Optional pre-encoded latent cache outside the repo (cached training path).
+# When set, it's bound read-only into the container; the config's data.cache_dir
+# must point at this same path.
+CACHE_DIR="${CACHE_DIR:-}"
+CACHE_BIND=""
+[ -n "${CACHE_DIR}" ] && CACHE_BIND="--bind $(readlink -f "${CACHE_DIR}"):$(readlink -f "${CACHE_DIR}"):ro"
 
 # HF auth from login shell.
 : "${HF_TOKEN:=${HUGGING_FACE_HUB_TOKEN:-}}"
@@ -91,6 +97,7 @@ mpirun \
         cd ${REPO_ROOT} &&
         singularity exec --nv --no-home \
             --bind ${REPO_ROOT}:${REPO_ROOT} \
+            ${CACHE_BIND} \
             --bind \${C_SCRATCH}/home:/root \
             --bind \${C_SCRATCH}/home:/home/${USER} \
             --bind \${C_SCRATCH}/cache:\${C_SCRATCH}/cache \

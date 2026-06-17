@@ -42,3 +42,6 @@ extras/
 .claude/
 tea_debug.log
 tb/
+
+# cluster-local cached-data configs (absolute cache paths)
+configs/*_cached.yaml
