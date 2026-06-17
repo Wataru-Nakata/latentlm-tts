@@ -1,0 +1,70 @@
+#!/bin/bash
+#PBS -N latentlm-sample-tts
+#PBS -l rt_QG=1
+#PBS -l walltime=00:30:00
+#PBS -W group_list=qgah50068
+#PBS -j oe
+#PBS -k oed
+#PBS -o logs/sample_tts.log
+
+# Sample a wav from a trained (Megatron dist) checkpoint, inside the SIF.
+# text -> LatentLM (Qwen backbone) -> 64-d latents -> VibeVoice decode -> .wav.
+# Single GPU (TP=1), single-rank distributed init. Submit (not on the login node):
+#     qsub examples/pbs/sample_tts.pbs
+#     CHECKPOINT=outputs/tts_qwen_500m/checkpoints/latest \
+#       PROMPT="Hello world." OUT=outputs/sample.wav qsub examples/pbs/sample_tts.pbs
+#
+# Env: SIF, REPO_ROOT, EXTRAS, CONFIG, CHECKPOINT, PROMPT, OUT, MAX_FRAMES,
+#      MIN_FRAMES, DPM_STEPS, CFG_SCALE.
+
+set -euo pipefail
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}"
+REPO_ROOT="$(readlink -f "${REPO_ROOT}")"
+SIF="$(readlink -f "${SIF:-${REPO_ROOT}/nemo_latentlm.sif}")"
+EXTRAS="${EXTRAS:-${REPO_ROOT}/extras}"
+CONFIG="${CONFIG:-configs/tts_qwen_500m.yaml}"
+CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/outputs/tts_qwen_500m/checkpoints/latest}"
+PROMPT="${PROMPT:-Hello, this is LatentLM speaking.}"
+OUT="${OUT:-${REPO_ROOT}/outputs/tts_qwen_500m/samples/sample.wav}"
+MAX_FRAMES="${MAX_FRAMES:-150}"
+MIN_FRAMES="${MIN_FRAMES:-0}"
+DPM_STEPS="${DPM_STEPS:-20}"
+CFG_SCALE="${CFG_SCALE:-4.0}"
+
+: "${HF_TOKEN:=${HUGGING_FACE_HUB_TOKEN:-}}"
+if [ -z "${HF_TOKEN}" ] && [ -s "${HOME}/.cache/huggingface/token" ]; then
+    HF_TOKEN="$(tr -d '[:space:]' < ${HOME}/.cache/huggingface/token)"
+fi
+export HF_TOKEN HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+
+JOB_NUM="${PBS_JOBID%%.*}"
+MASTER_PORT="${MASTER_PORT:-$((29500 + JOB_NUM % 1000))}"
+
+C_SCRATCH="${PBS_LOCALDIR:-/tmp}/cont_scratch"
+mkdir -p "${REPO_ROOT}/logs" "$(dirname "${OUT}")" "${C_SCRATCH}"/{home,cache,flashinfer,hf}
+cd "${REPO_ROOT}"
+nvidia-smi -L || true
+echo "[sample-tts] prompt=${PROMPT}  ckpt=${CHECKPOINT}"
+
+singularity exec --nv --no-home \
+    --bind "${REPO_ROOT}:${REPO_ROOT}" \
+    --bind "${C_SCRATCH}/home:/root" \
+    --bind "${C_SCRATCH}/home:/home/${USER}" \
+    --bind "${C_SCRATCH}/cache:${C_SCRATCH}/cache" \
+    --env XDG_CACHE_HOME="${C_SCRATCH}/cache" \
+    --env FLASHINFER_JIT_DIR="${C_SCRATCH}/flashinfer" \
+    --env HF_HOME="${C_SCRATCH}/hf" \
+    --env HF_TOKEN="${HF_TOKEN}" \
+    --env HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}" \
+    --env PYTHONPATH="${EXTRAS}:${REPO_ROOT}" \
+    --env CUDA_DEVICE_MAX_CONNECTIONS=1 \
+    --env MASTER_ADDR=127.0.0.1 --env MASTER_PORT="${MASTER_PORT}" \
+    --env RANK=0 --env LOCAL_RANK=0 --env WORLD_SIZE=1 \
+    "${SIF}" \
+    bash -c "cd ${REPO_ROOT} && python scripts/sample_tts.py \
+        --config ${CONFIG} --resume-from ${CHECKPOINT} \
+        --prompt \"${PROMPT}\" --out ${OUT} \
+        --max-frames ${MAX_FRAMES} --min-frames ${MIN_FRAMES} \
+        --dpm-steps ${DPM_STEPS} --cfg-scale ${CFG_SCALE}"
+
+echo "[sample-tts] wrote ${OUT}"
