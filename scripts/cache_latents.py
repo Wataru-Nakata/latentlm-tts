@@ -46,7 +46,8 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=8,
                         help="VibeVoice encode batch size.")
     parser.add_argument("--start-index", type=int, default=0)
-    parser.add_argument("--text-tokenizer", default="gpt2")
+    parser.add_argument("--text-tokenizer", default="Qwen/Qwen2.5-0.5B",
+                        help="Must match tokenizer.text in your train config.")
     parser.add_argument("--rank", type=int, default=0,
                         help="Job rank for sharded parallel cache builds.")
     parser.add_argument("--world-size", type=int, default=1,

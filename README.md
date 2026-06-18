@@ -34,6 +34,26 @@ against a matching CUDA toolchain (`pip install -e ".[train]"`), but the NVIDIA
 NeMo container (`containers/nemo_latentlm.def`) bundles it and is the path of
 least resistance — see `examples/pbs/` for reference job scripts.
 
+### Container setup (one-time)
+
+If you use the NeMo container, run these once before training:
+
+```bash
+qsub examples/pbs/build_sif.pbs        # build nemo_latentlm.sif from the def
+qsub examples/pbs/install_extras.pbs   # populate ./extras  (see below)
+```
+
+`install_extras.pbs` exists because the NeMo image ships `megatron-core` /
+`megatron-bridge` as *editable* installs under `/opt/Megatron-Bridge/...`, a
+`root:root drwxrwx---` path that a non-root container user cannot read — so
+`import megatron.core` fails with `PermissionError`. The script pip-installs a
+readable copy of those packages into a user-writable prefix (`./extras`, which
+is `.gitignore`d), and `examples/pbs/train_tts.pbs` puts it first on
+`PYTHONPATH` (`PYTHONPATH=$EXTRAS:$REPO_ROOT`) so it shadows the broken editable
+install. If your environment has a *readable* megatron install (e.g. a plain
+`pip install` venv rather than this image), you can skip this step and leave
+`EXTRAS` empty.
+
 ## Quickstart — training
 
 ```bash

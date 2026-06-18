@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -N latentlm-install-extras
+#PBS -l rt_QC=1
+#PBS -l walltime=01:00:00
+#PBS -W group_list=qgah50068
+#PBS -j oe
+#PBS -k oed
+#PBS -o logs/install_extras.log
+
+# One-time setup for the container training path.
+#
+# The NeMo NGC image ships megatron-core / megatron-bridge as *editable*
+# installs pointing at /opt/Megatron-Bridge/3rdparty/, which is root:root
+# drwxrwx--- and therefore unreadable by an ordinary (non-root) container user.
+# `import megatron.core` then dies with PermissionError. To work around it we
+# pip-install a readable copy of those packages into a user-writable prefix
+# (${EXTRAS}, default <repo>/extras) and put it first on PYTHONPATH at run time
+# (examples/pbs/train_tts.pbs already does `PYTHONPATH=${EXTRAS}:${REPO_ROOT}`),
+# so it shadows the broken editable install.
+#
+# Heavy deps (torch, transformer-engine, apex, flash-attn) and the data/audio
+# stack (transformers, datasets, diffusers, soundfile, librosa) are already in
+# the NeMo image, so we install --no-deps and only the two megatron packages.
+#
+# Run ONCE after building the SIF, before training:
+#     qsub examples/pbs/build_sif.pbs        # produces nemo_latentlm.sif
+#     qsub examples/pbs/install_extras.pbs   # populates ./extras
+#     CACHE_DIR=... qsub examples/pbs/train_tts.pbs
+#
+# Env: SIF (path to .sif), REPO_ROOT, EXTRAS (default <repo>/extras).
+
+set -euo pipefail
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}"
+REPO_ROOT="$(readlink -f "${REPO_ROOT}")"
+SIF="$(readlink -f "${SIF:-${REPO_ROOT}/nemo_latentlm.sif}")"
+EXTRAS="${EXTRAS:-${REPO_ROOT}/extras}"
+
+mkdir -p "${EXTRAS}" "${REPO_ROOT}/logs"
+cd "${REPO_ROOT}"
+echo "[install_extras] sif=${SIF}  extras=${EXTRAS}"
+
+# Wipe any prior megatron tree so the two packages install cleanly into the
+# shared megatron/ namespace in a single pip call (separate --target upgrades
+# clobber each other's namespace contents).
+rm -rf "${EXTRAS}"/megatron "${EXTRAS}"/megatron_core* "${EXTRAS}"/megatron_bridge* 2>/dev/null || true
+
+singularity exec \
+    --bind "${REPO_ROOT}:${REPO_ROOT}" \
+    --env PIP_NO_CACHE_DIR=1 \
+    "${SIF}" \
+    bash -lc "pip install --no-deps --target=${EXTRAS} \
+                  'megatron-core==0.17.0rc0' 'megatron-bridge==0.4.0' 'hf_transfer'"
+
+echo "[install_extras] installed into ${EXTRAS}:"
+ls "${EXTRAS}" | head -20
+echo "[install_extras] done"
