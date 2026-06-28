@@ -28,7 +28,15 @@ class EmiliaConfig:
     languages: tuple[str, ...] = ()  # empty = don't filter by language column
     max_audio_seconds: float = 20.0
     min_audio_seconds: float = 1.0
-    shuffle_buffer: int = 1_000
+    # Streaming-only diversity knob. HF `IterableDataset.shuffle` shuffles shard
+    # ORDER *and* keeps a `shuffle_buffer` of records; cross-shard mixing only
+    # reaches as far as the buffer spans. The cached path interleaves 16 shards
+    # + a buffer for near-i.i.d. batches (see CachedDataset.N_PARALLEL); to
+    # approximate that here we use a larger buffer so it spans several shards.
+    # It carries raw (lazily-decoded) audio records, so bigger = more worker RAM.
+    # NOTE: this only aligns shuffle *diversity*, not throughput — streaming can
+    # still starve the GPU and overfit a narrow slice; caching is the real fix.
+    shuffle_buffer: int = 5_000
     seed: int = 0
     # HF streaming doesn't cache raw audio; this points at a writable scratch
     # dir on the compute node for metadata caches.

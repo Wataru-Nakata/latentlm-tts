@@ -23,7 +23,7 @@ data:
   languages: []
   min_audio_seconds: 1.0
   max_audio_seconds: 20.0
-  shuffle_buffer: 1000
+  shuffle_buffer: 5000             # spans multiple shards for cross-shard mixing (streaming-only; see EmiliaConfig)
   num_workers: 16
   max_text_tokens: 256
   max_latent_frames: 200
