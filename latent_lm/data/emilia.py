@@ -93,6 +93,14 @@ def build_emilia_stream(cfg: EmiliaConfig, *, rank: int = 0, world_size: int = 1
             raise FileNotFoundError(
                 f"no tars under {cfg.local_data_dir}/{{{','.join(subsets)}}}/"
                 f"{{{','.join(langs)}}}")
+        # STAGE 1 — shard-level shuffle. The glob above is sorted (deterministic)
+        # but groups shards by subset/language; reading them in that order means
+        # long single-language runs. Shuffle the shard (file) list up front, with
+        # a fixed seed, so the *order shards are streamed in* is randomized before
+        # any record-level shuffling. (split_dataset_by_node below then hands each
+        # rank a slice of this shuffled order.)
+        import random as _random
+        _random.Random(cfg.seed).shuffle(files)
         ds = load_dataset(
             "webdataset",
             data_files={cfg.split: files},
@@ -113,6 +121,12 @@ def build_emilia_stream(cfg: EmiliaConfig, *, rank: int = 0, world_size: int = 1
     # Column name is "mp3", not "audio".
     ds = ds.cast_column("mp3", Audio(sampling_rate=24_000, mono=True))
 
+    # STAGE 2 — record-level ("audio") shuffle. After the shards are ordered
+    # (stage 1 for local mode; HF's own shard-order shuffle for the HF-stream
+    # mode), `.shuffle` reads records into a `shuffle_buffer` and emits them in
+    # random order. So the pipeline is: shuffle shards FIRST, then shuffle the
+    # audio records within the buffer — the buffer (now spanning several shards)
+    # mixes content across the already-randomized shard order.
     ds = ds.shuffle(buffer_size=cfg.shuffle_buffer, seed=cfg.seed)
     ds = split_dataset_by_node(ds, rank=rank, world_size=world_size)
     return ds
