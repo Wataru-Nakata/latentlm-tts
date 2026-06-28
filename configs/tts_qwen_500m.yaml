@@ -22,7 +22,7 @@ data:
   min_audio_seconds: 1.0
   max_audio_seconds: 20.0
   shuffle_buffer: 5000             # spans multiple shards for cross-shard mixing (streaming-only; see EmiliaConfig)
-  num_workers: 4
+  num_workers: 16             # streaming: each worker reads a different shard, so this also sets the cross-shard interleave width (~cached N_PARALLEL=16) and HF download parallelism
   max_text_tokens: 256
   max_latent_frames: 200
   cache_dir: null
