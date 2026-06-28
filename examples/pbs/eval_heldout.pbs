@@ -1,0 +1,60 @@
+#!/bin/bash
+#PBS -N latentlm-eval-heldout
+#PBS -l rt_QG=1
+#PBS -l walltime=00:30:00
+#PBS -W group_list=qgah50068
+#PBS -j oe
+#PBS -k oed
+#PBS -o logs/eval_heldout.log
+
+# Evaluate any checkpoint on a FIXED cached held-out set (train.py --eval-only),
+# regardless of how it was trained. Lets us measure a streaming-trained ckpt on
+# the same held-out set the cached run uses, to disambiguate a real regression
+# from a streaming-eval-metric artifact. Single GPU (TP=1), single rank.
+#
+#   CHECKPOINT=<ckpt dir> CACHE_DIR=<latent cache> qsub examples/pbs/eval_heldout.pbs
+#
+# Env: SIF, REPO_ROOT, EXTRAS, CONFIG (cached config), CHECKPOINT, CACHE_DIR.
+
+set -euo pipefail
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}"
+REPO_ROOT="$(readlink -f "${REPO_ROOT}")"
+SIF="$(readlink -f "${SIF:-${REPO_ROOT}/nemo_latentlm.sif}")"
+EXTRAS="${EXTRAS:-${REPO_ROOT}/extras}"
+CONFIG="${CONFIG:-configs/tts_qwen_500m_cached.yaml}"
+CHECKPOINT="${CHECKPOINT:?set CHECKPOINT to the checkpoint dir to evaluate}"
+CACHE_DIR="${CACHE_DIR:-}"
+CACHE_BIND=""
+[ -n "${CACHE_DIR}" ] && CACHE_BIND="--bind $(readlink -f "${CACHE_DIR}"):$(readlink -f "${CACHE_DIR}"):ro"
+
+: "${HF_TOKEN:=${HUGGING_FACE_HUB_TOKEN:-}}"
+if [ -z "${HF_TOKEN}" ] && [ -s "${HOME}/.cache/huggingface/token" ]; then
+    HF_TOKEN="$(tr -d '[:space:]' < ${HOME}/.cache/huggingface/token)"
+fi
+export HF_TOKEN HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+
+JOB_NUM="${PBS_JOBID%%.*}"
+MASTER_PORT="${MASTER_PORT:-$((29500 + JOB_NUM % 1000))}"
+C_SCRATCH="${PBS_LOCALDIR:-/tmp}/cont_scratch"
+mkdir -p "${REPO_ROOT}/logs" "${C_SCRATCH}"/{home,cache,flashinfer,hf}
+cd "${REPO_ROOT}"
+echo "[eval-heldout] ckpt=${CHECKPOINT} config=${CONFIG}"
+
+singularity exec --nv --no-home \
+    --bind "${REPO_ROOT}:${REPO_ROOT}" \
+    ${CACHE_BIND} \
+    --bind "${C_SCRATCH}/home:/root" \
+    --bind "${C_SCRATCH}/home:/home/${USER}" \
+    --bind "${C_SCRATCH}/cache:${C_SCRATCH}/cache" \
+    --env XDG_CACHE_HOME="${C_SCRATCH}/cache" \
+    --env FLASHINFER_JIT_DIR="${C_SCRATCH}/flashinfer" \
+    --env HF_HOME="${C_SCRATCH}/hf" \
+    --env HF_TOKEN="${HF_TOKEN}" --env HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}" \
+    --env PYTHONPATH="${EXTRAS}:${REPO_ROOT}" \
+    --env CUDA_DEVICE_MAX_CONNECTIONS=1 \
+    --env MASTER_ADDR=127.0.0.1 --env MASTER_PORT="${MASTER_PORT}" \
+    --env RANK=0 --env LOCAL_RANK=0 --env WORLD_SIZE=1 \
+    "${SIF}" \
+    bash -c "cd ${REPO_ROOT} && python -m latent_lm.train \
+        --config ${CONFIG} --eval-only --train-steps 1 --resume-from ${CHECKPOINT}"
+echo "[eval-heldout] done"

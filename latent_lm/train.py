@@ -265,7 +265,10 @@ def _pack_batch_from_audio(*, text_ids_list, audio, audio_lens, vv, specials,
     from .models.tokenizer import LATENT_SCALE
 
     with torch.no_grad():
-        latents_batch = vv.encode(audio.to(device))   # (B, T_lat, 64)
+        # Pass lengths → per-clip (padding-invariant) encode. Without this, random
+        # micro-batches pad short clips heavily and corrupt their latents, which
+        # collapses streaming training (see VibeVoiceTokenizer.encode docstring).
+        latents_batch = vv.encode(audio.to(device), lengths=audio_lens)   # (B, T_lat, 64)
     lat_lens = (audio_lens + encoder_stride - 1) // encoder_stride
     packed_examples = [
         pack_example(
@@ -588,6 +591,27 @@ def train(args, cfg) -> int:
                      if hasattr(cfg.runtime, "get") else 1)
     log_every = int(cfg.runtime.get("log_every_n_steps", 20)
                     if hasattr(cfg.runtime, "get") else 20)
+
+    # --eval-only: load (via --resume-from), run one held-out eval sweep, exit.
+    # Used to measure a checkpoint on a FIXED held-out set regardless of how it
+    # was trained — e.g. eval a streaming-trained ckpt on the cached held-out to
+    # tell whether streaming's rising eval/lm is a real regression or just an
+    # artifact of streaming's non-fixed (train-loader fallback) eval set.
+    if getattr(args, "eval_only", False):
+        if dl_eval is None:
+            _log("[eval-only] no held-out eval dataloader — set cache_dir + "
+                 "eval_holdout_frac (or valid_cache_dir) in the config")
+            return 2
+        em = _run_eval(
+            model=model, inner_model=inner_model, dl=dl_eval, loss_fn=loss_fn,
+            tok=tok, vv=vv, use_cache=True, pack_cfg=pack_cfg, device=device, dt=dt,
+            tfm_cfg=tfm_cfg, packed_total_length=packed_total_length,
+            n_batches=int(cfg.runtime.get("eval_batches", 50)
+                          if hasattr(cfg.runtime, "get") else 50))
+        _log(f"[eval-only] resume={args.resume_from} held-out eval: "
+             f"loss={em['loss']:.4f} lm={em['lm']:.4f} diff={em['diff']:.4f} n={em['n']}")
+        return 0
+
     if packed_total_length:
         _log(f"[train] sequence packing ON: packed_total_length={packed_total_length}")
     if grad_accum > 1:
@@ -873,6 +897,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Load --resume-from, run one held-out eval sweep, exit.")
     parser.add_argument("--train-steps", type=int, default=0,
                         help="Number of training iterations to run. 0 = dry-run build only.")
     parser.add_argument("--resume-from", type=str, default=None,
@@ -883,7 +909,7 @@ def main() -> int:
     _log(f"[train] config: {args.config}")
 
     try:
-        if args.train_steps > 0:
+        if args.train_steps > 0 or args.eval_only:
             return train(args, cfg)
         # Otherwise: just build the model and report.
         from .data.text_tokenizer import TextTokenizer, TextTokenizerConfig

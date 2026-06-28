@@ -66,28 +66,59 @@ class VibeVoiceTokenizer(nn.Module):
         for p in self.model.parameters():
             p.requires_grad_(False)
 
+    def _encode_values(self, input_values: torch.Tensor) -> torch.Tensor:
+        encoded = self.model.encode(input_values, sample=False)
+        return encoded["latents"] if isinstance(encoded, dict) else encoded.latents
+
     @torch.no_grad()
     def encode(self, waveforms: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
-        """Encode a batch of 16 kHz mono waveforms to (B, T_latent, 64).
+        """Encode a batch of 24 kHz mono waveforms to (B, T_latent, 64).
 
         Args:
-            waveforms: (B, N_samples) float tensor, peak-normalised.
-            lengths: optional (B,) int tensor of valid sample counts.
+            waveforms: (B, N_samples) float tensor.
+            lengths: optional (B,) valid sample counts. **Strongly recommended.**
 
         Returns:
-            latents: (B, T_latent, 64) in the module's dtype.
+            latents: (B, T_latent, 64) in the module's dtype, right-zero-padded.
+
+        Padding-invariance (critical for the streaming path): VibeVoice's feature
+        extractor normalises over the *whole* (padded) input, so a batched encode
+        that right-pads every clip to the batch's longest clip makes each clip's
+        latents depend on its batch mates — *all* frames shift, more for shorter
+        clips (measured: +20 frames of pad → max|Δ|≈1.75 on std≈5 latents). With
+        random micro-batches (streaming) a 2 s clip paired with a 20 s clip gets
+        heavily padded → its latents are badly corrupted. Training then sees a
+        corrupted latent distribution while the cached held-out is clean → the
+        run diverges/collapses. The cached path avoids this: latents are read
+        from disk (encoded once, length-sorted → light padding).
+
+        Fix: when `lengths` is given, encode each clip **individually**, padded
+        only to its own ENCODER_STRIDE multiple — a canonical, batch-independent
+        latent. Callers slice back to per-clip length via `lengths`.
         """
-        inputs = self.feature_extractor(
-            [w.detach().cpu().numpy() for w in waveforms],
-            sampling_rate=SAMPLE_RATE,
-            pad_to_multiple_of=ENCODER_STRIDE,
-            return_tensors="pt",
-        )
-        input_values = inputs.input_values.to(self.cfg.device, dtype=self.cfg.dtype)
-        encoded = self.model.encode(input_values, sample=False)
-        # Normalise return shape across VibeVoice versions.
-        latents = encoded["latents"] if isinstance(encoded, dict) else encoded.latents
-        return latents
+        if lengths is None:
+            inputs = self.feature_extractor(
+                [w.detach().cpu().numpy() for w in waveforms],
+                sampling_rate=SAMPLE_RATE, pad_to_multiple_of=ENCODER_STRIDE,
+                return_tensors="pt",
+            )
+            iv = inputs.input_values.to(self.cfg.device, dtype=self.cfg.dtype)
+            return self._encode_values(iv)
+
+        per_clip = []
+        for i, w in enumerate(waveforms):
+            wv = w[: int(lengths[i])]
+            inp = self.feature_extractor(
+                [wv.detach().cpu().numpy()], sampling_rate=SAMPLE_RATE,
+                pad_to_multiple_of=ENCODER_STRIDE, return_tensors="pt",
+            )
+            iv = inp.input_values.to(self.cfg.device, dtype=self.cfg.dtype)
+            per_clip.append(self._encode_values(iv)[0])   # (T_i, 64)
+        t_max = max(int(l.shape[0]) for l in per_clip)
+        out = per_clip[0].new_zeros(len(per_clip), t_max, per_clip[0].shape[-1])
+        for i, l in enumerate(per_clip):
+            out[i, : l.shape[0]] = l
+        return out
 
     @torch.no_grad()
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
