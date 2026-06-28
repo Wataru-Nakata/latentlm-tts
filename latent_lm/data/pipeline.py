@@ -42,6 +42,11 @@ class PipelineConfig:
     num_workers: int = 2
     prefetch_factor: int = 4
     batch_size: int = 4
+    # Streaming mode only: pull this many raw clips per DataLoader batch so the
+    # main process can densely bin-pack them into full `packed_total_length`
+    # sequences (matching the cached path). 0 = legacy (batch_size clips/pack →
+    # mostly padding → tiny effective batch → training collapses).
+    stream_pack_clips: int = 0
     # Enables cached mode when set to a directory with shard-*.pt files.
     cache_dir: str | None = None
     # Optional dedicated validation cache dir (read in full for eval). When set,
@@ -162,18 +167,13 @@ class _CachedTokenizedDataset(IterableDataset):
 
 
 def _collate_streaming(batch: list[dict], *, audio_encoder_stride: int) -> dict:
-    lens = torch.tensor([b["audio_len"] for b in batch], dtype=torch.long)
-    max_len = int(lens.max().item())
-    pad_to = ((max_len + audio_encoder_stride - 1) // audio_encoder_stride) * audio_encoder_stride
-    B = len(batch)
-    audio = torch.zeros((B, pad_to), dtype=torch.float32)
-    for i, b in enumerate(batch):
-        a = b["audio"]
-        audio[i, : a.shape[0]] = a
+    # Return clips as a list (variable length). _pack_batch_from_audio encodes
+    # them in length-sorted chunks, so we avoid materialising one giant
+    # (N, max_len) padded tensor here (N can be ~200 for dense packing).
     return {
         "text_ids": [b["text_ids"] for b in batch],
-        "audio": audio,
-        "audio_lens": lens,
+        "audio": [b["audio"] for b in batch],
+        "audio_lens": torch.tensor([b["audio_len"] for b in batch], dtype=torch.long),
     }
 
 
@@ -224,18 +224,24 @@ def make_dataloader(cfg: PipelineConfig, tokenizer: TextTokenizer, *, rank: int 
                                               total_length=total_length)
         else:
             collate = _collate_cached
+        dl_batch_size = cfg.batch_size
     else:
         ds = _StreamingDataset(cfg, tokenizer, rank=rank, world_size=world_size)
 
         def collate(batch):
             return _collate_streaming(batch, audio_encoder_stride=cfg.audio_encoder_stride)
 
+        # Pull many clips per batch so the main process can densely bin-pack
+        # them into full packs (see _pack_batch_from_audio). Falls back to
+        # batch_size (legacy, sparse) when stream_pack_clips is 0.
+        dl_batch_size = cfg.stream_pack_clips or cfg.batch_size
+
     return DataLoader(
         ds,
-        batch_size=cfg.batch_size,
+        batch_size=dl_batch_size,
         collate_fn=collate,
         num_workers=cfg.num_workers,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=(cfg.num_workers > 0),
-        pin_memory=True,
+        pin_memory=(cfg.cache_dir is not None),
     )

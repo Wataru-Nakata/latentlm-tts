@@ -257,33 +257,75 @@ def _finalise_batch(packed_examples, *, specials, packed_total_length, device):
 
 
 def _pack_batch_from_audio(*, text_ids_list, audio, audio_lens, vv, specials,
-                           pack_cfg, encoder_stride, device, packed_total_length=0):
-    """Streaming mode: encode audio with VibeVoice, then collate."""
+                           pack_cfg, encoder_stride, device, packed_total_length=0,
+                           encode_chunk=8):
+    """Streaming mode: encode audio with VibeVoice, then DENSELY bin-pack.
+
+    `audio` is a list of variable-length 1-D waveforms (the streaming DataLoader
+    pulls many clips per batch via `stream_pack_clips`). We:
+      1. encode in length-sorted chunks (light padding → low pad-corruption and
+         fast, matching how cache_latents.py built the cache);
+      2. greedily bin-pack the clips into FULL `packed_total_length` sequences;
+      3. concatenate the packs (block-diagonal) via `_collate_cached_packed`.
+
+    Without dense packing a micro-batch of 2 clips fills ~1% of an 8192 pack
+    (the rest padding) → the diffusion head / LM see ~2 clips per step → the
+    effective batch is ~80× smaller than the cached path → training collapses.
+    """
     import torch
 
-    from .data.collate import pack_example
+    from .data.collate import collate_packed, pack_example
+    from .data.pipeline import _collate_cached_packed
     from .models.tokenizer import LATENT_SCALE
 
+    if not isinstance(audio, list):  # legacy: a padded (B, N) tensor
+        audio = [audio[i, : int(audio_lens[i])] for i in range(audio.shape[0])]
+    B = len(audio)
+    order = sorted(range(B), key=lambda i: int(audio[i].shape[0]))
+    latents = [None] * B
     with torch.no_grad():
-        # Pass lengths → per-clip (padding-invariant) encode. Without this, random
-        # micro-batches pad short clips heavily and corrupt their latents, which
-        # collapses streaming training (see VibeVoiceTokenizer.encode docstring).
-        latents_batch = vv.encode(audio.to(device), lengths=audio_lens)   # (B, T_lat, 64)
-    lat_lens = (audio_lens + encoder_stride - 1) // encoder_stride
-    packed_examples = [
-        pack_example(
-            text_ids=text_ids_list[i],
-            # Scale to ~unit variance — DDPM ε-prediction needs x0 ~ N(0,1).
-            # VibeVoice latents have native std≈5.12; LATENT_SCALE ≈ 0.195.
-            latents=(latents_batch[i, : int(lat_lens[i].item())].float().cpu()
-                     * LATENT_SCALE),
-            specials=specials,
-            cfg=pack_cfg,
-        )
-        for i in range(audio.shape[0])
+        for s in range(0, B, encode_chunk):
+            idx = order[s : s + encode_chunk]
+            maxlen = max(int(audio[i].shape[0]) for i in idx)
+            pad_to = ((maxlen + encoder_stride - 1) // encoder_stride) * encoder_stride
+            sub = audio[idx[0]].new_zeros(len(idx), pad_to)
+            for j, i in enumerate(idx):
+                sub[j, : int(audio[i].shape[0])] = audio[i]
+            # length-sorted chunk → only light intra-chunk padding, so a batched
+            # (fast) encode introduces negligible pad-corruption.
+            lat = vv.encode(sub.to(device))  # (chunk, T_chunk, 64)
+            for j, i in enumerate(idx):
+                tl = (int(audio[i].shape[0]) + encoder_stride - 1) // encoder_stride
+                latents[i] = lat[j, :tl].float().cpu()
+
+    examples = [
+        pack_example(text_ids=text_ids_list[i],
+                     latents=latents[i] * LATENT_SCALE,  # x0 ~ N(0,1) for DDPM
+                     specials=specials, cfg=pack_cfg)
+        for i in range(B)
     ]
-    return _finalise_batch(packed_examples, specials=specials,
-                           packed_total_length=packed_total_length, device=device)
+
+    if not (packed_total_length and packed_total_length > 0):
+        return _finalise_batch(examples, specials=specials,
+                               packed_total_length=0, device=device)
+
+    # Greedy bin-pack into full packs.
+    bins, cur, acc = [], [], 0
+    for e in examples:
+        L = int(e["length"])
+        if L > packed_total_length:
+            continue  # single doc longer than a whole pack — drop
+        if acc + L > packed_total_length and cur:
+            bins.append(cur); cur, acc = [], 0
+        cur.append(e); acc += L
+    if cur:
+        bins.append(cur)
+    packs = [collate_packed(b, specials=specials, total_length=packed_total_length)
+             for b in bins]
+    batch = _collate_cached_packed(packs, specials=specials,
+                                   total_length=packed_total_length)
+    return {k: (v.to(device, non_blocking=True) if hasattr(v, "to") else v)
+            for k, v in batch.items()}
 
 
 def _pack_batch_from_cache(*, text_ids_list, latents_list, specials, pack_cfg,
@@ -509,13 +551,29 @@ def train(args, cfg) -> int:
         min_audio_seconds=cfg.data.min_audio_seconds,
         max_audio_seconds=cfg.data.max_audio_seconds,
         shuffle_buffer=cfg.data.shuffle_buffer,
+        # Optional: stream from a local Emilia snapshot instead of HF (no network
+        # dependency at train time; HF's dataset API can 504 mid-run).
+        local_data_dir=cfg.data.get("local_data_dir", None),
     )
+    # Streaming dense packing: pull enough raw clips per batch to bin-pack into
+    # ~micro_batch full packs (~packed_total_length/70 clips per pack + headroom).
+    # Overridable via runtime.stream_pack_clips.
+    if not use_cache and packed_total_length:
+        # ~packed_total_length/140 clips fill one pack (avg ~140 positions/clip),
+        # so this targets ~micro_batch full packs per step (≈ cached VRAM).
+        _default_spc = int(cfg.runtime.micro_batch_size) * (packed_total_length // 140 + 1)
+        stream_pack_clips = int(cfg.runtime.get("stream_pack_clips", _default_spc)
+                                if hasattr(cfg.runtime, "get") else _default_spc)
+    else:
+        stream_pack_clips = 0
+
     pipe_cfg = PipelineConfig(
         emilia=emilia_cfg,
         max_text_tokens=cfg.data.max_text_tokens,
         audio_encoder_stride=ENCODER_STRIDE,
         num_workers=int(cfg.data.num_workers),
         batch_size=int(cfg.runtime.micro_batch_size),
+        stream_pack_clips=stream_pack_clips,
         cache_dir=cache_dir,
         # Push pack_example + collate_packed into the worker. Main loop then
         # only does H2D + forward — no per-step Python pack cost between
@@ -672,7 +730,7 @@ def train(args, cfg) -> int:
                 else:
                     batch = _pack_batch_from_audio(
                         text_ids_list=raw["text_ids"],
-                        audio=raw["audio"].to(device),
+                        audio=raw["audio"],
                         audio_lens=raw["audio_lens"],
                         vv=vv, specials=tok.specials, pack_cfg=pack_cfg,
                         encoder_stride=ENCODER_STRIDE, device=device,
@@ -699,7 +757,7 @@ def train(args, cfg) -> int:
         else:
             batch = _pack_batch_from_audio(
                 text_ids_list=raw["text_ids"],
-                audio=raw["audio"].to(device),
+                audio=raw["audio"],
                 audio_lens=raw["audio_lens"],
                 vv=vv, specials=tok.specials, pack_cfg=pack_cfg,
                 encoder_stride=ENCODER_STRIDE, device=device,
@@ -858,7 +916,7 @@ def _run_eval(*, model, inner_model, dl, loss_fn, tok, vv, use_cache, pack_cfg,
                      for k, v in raw.items()}
         else:
             batch = _pack_batch_from_audio(
-                text_ids_list=raw["text_ids"], audio=raw["audio"].to(device),
+                text_ids_list=raw["text_ids"], audio=raw["audio"],
                 audio_lens=raw["audio_lens"], vv=vv, specials=tok.specials,
                 pack_cfg=pack_cfg, encoder_stride=__import__(
                     "latent_lm.models.tokenizer", fromlist=["ENCODER_STRIDE"]).ENCODER_STRIDE,
