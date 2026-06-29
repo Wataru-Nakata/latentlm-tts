@@ -45,3 +45,5 @@ tb/
 
 # cluster-local cached-data configs (absolute cache paths)
 configs/*_cached.yaml
+
+configs/*_localsnap.yaml
