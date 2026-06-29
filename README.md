@@ -56,21 +56,31 @@ install. If your environment has a *readable* megatron install (e.g. a plain
 
 ## Quickstart — training
 
+**Cache the latents first, then train on the cache.** This is the recommended
+(and only practical) path for real runs:
+
 ```bash
-# single node, N GPUs
+# 1) pre-encode Emilia → 64-d latent shards (once)
+python scripts/cache_latents.py --cache-dir ./cache/emilia_en --languages en
+#    (or examples/pbs/cache_emilia.pbs; run several shards in parallel)
+
+# 2) train, pointing data.cache_dir at that directory
 torchrun --standalone --nproc_per_node=4 -m latent_lm.train \
-    --config configs/tts_qwen_500m.yaml --train-steps 50000
-# or: ./scripts/launch.sh 4 configs/tts_qwen_500m.yaml --train-steps 50000
+    --config configs/tts_qwen_500m.yaml --train-steps 200000
+# or: ./scripts/launch.sh 4 configs/tts_qwen_500m.yaml --train-steps 200000
 # multi-node: examples/pbs/train_tts.pbs (mpirun rendezvous, adapt to your scheduler)
 ```
 
-`configs/tts_smoke.yaml` is a tiny config for a quick end-to-end check. Pre-encode
-latents first (optional, faster steady-state) and point `data.cache_dir` at the
-output:
+Set `data.cache_dir` (in the YAML) to your cache. `configs/tts_smoke.yaml` is a
+tiny config for a quick end-to-end check.
 
-```bash
-python scripts/cache_latents.py --cache-dir ./cache/emilia_en --languages en
-```
+> **Why cache, not stream?** With `data.cache_dir: null` the trainer streams
+> Emilia and runs the (frozen) VibeVoice encoder on the GPU *every step*. That
+> works but is **~30× slower** and you re-encode the same audio every epoch.
+> Streaming is fine for a smoke/exploration run; for anything real, encode once
+> with `cache_latents.py` and train from the cache. (The trainer densely packs
+> either way — an earlier streaming bug that left sequences ~99% padding, which
+> collapsed training, is fixed; see `latent_lm/train.py:_pack_batch_from_audio`.)
 
 ## Inference
 
